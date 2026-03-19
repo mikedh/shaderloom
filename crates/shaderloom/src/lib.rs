@@ -1,4 +1,5 @@
 pub mod globutils;
+pub mod gpu_exec;
 pub mod luaexec;
 pub mod naga_parse;
 
@@ -64,6 +65,7 @@ impl Default for Shaderloom {
 
 // Re-export related types for advanced users
 pub use globutils::{GlobItem, glob_items};
+pub use gpu_exec::{Binding, create_gpu, run_compute};
 pub use naga_parse::{LuaWGSLModule, parse_and_validate_wgsl, parse_wgsl};
 
 #[cfg(test)]
@@ -100,6 +102,10 @@ mod tests {
             .run_tests("targets.python.xgpu")
             .unwrap();
         shaderloom.executor().run_tests("tests.dev").unwrap();
+        shaderloom
+            .executor()
+            .run_tests("tests.shader_test")
+            .unwrap();
     }
 
     #[test]
@@ -138,5 +144,12 @@ mod tests {
     #[test]
     fn lua_dev() {
         LuaExecutor::new().run_tests("tests.dev").unwrap();
+    }
+
+    #[test]
+    fn lua_shader_test() {
+        LuaExecutor::new()
+            .run_tests("tests.shader_test")
+            .unwrap();
     }
 }

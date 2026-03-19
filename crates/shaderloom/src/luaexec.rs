@@ -1,19 +1,15 @@
 use std::path::Path;
 
 use crate::globutils::glob_items;
+use crate::gpu_exec;
 use crate::naga_parse::{LuaWGSLModule, parse_and_validate_wgsl, parse_wgsl};
 use anyhow::Result;
 use mlua::{Function, Lua, LuaSerdeExt, Table, UserData};
 
 static LUA_EMBEDS: &str = include_str!(concat!(env!("OUT_DIR"), "/embedded_lua_bundle.lua"));
 
+#[derive(Default)]
 pub struct LuaLoomInterface {}
-
-impl LuaLoomInterface {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
 
 impl UserData for LuaLoomInterface {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
@@ -38,11 +34,70 @@ impl UserData for LuaLoomInterface {
             println!("{}", msg);
             Ok(())
         });
+
+        methods.add_method(
+            "run_compute",
+            |lua,
+             _this,
+             (source, entry_point, bindings_table, workgroups_table): (
+                String,
+                String,
+                Table,
+                Table,
+            )| {
+                let (device, queue) = gpu_exec::create_gpu()?;
+
+                let wg: [u32; 3] = [
+                    workgroups_table.get(1)?,
+                    workgroups_table.get(2)?,
+                    workgroups_table.get(3)?,
+                ];
+
+                let mut all_data: Vec<Vec<u8>> = Vec::new();
+                let mut kinds: Vec<String> = Vec::new();
+                for entry in bindings_table.sequence_values::<Table>() {
+                    let entry = entry?;
+                    let kind: String = entry.get("kind")?;
+                    let data: mlua::String = entry.get("data")?;
+                    all_data.push(data.as_bytes().to_vec());
+                    kinds.push(kind);
+                }
+
+                let mut bindings = Vec::new();
+                for (data, kind) in all_data.iter().zip(kinds.iter()) {
+                    bindings.push(match kind.as_str() {
+                        "uniform" => gpu_exec::Binding::Uniform(data),
+                        "read" => gpu_exec::Binding::StorageRead(data),
+                        "read_write" => gpu_exec::Binding::StorageReadWrite(data),
+                        other => {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "Unknown binding kind: {other}"
+                            )))
+                        }
+                    });
+                }
+
+                let results =
+                    gpu_exec::run_compute(&device, &queue, &source, &entry_point, &bindings, wg)?;
+
+                let result_table = lua.create_table()?;
+                for (i, data) in results.iter().enumerate() {
+                    result_table.set(i + 1, lua.create_string(data)?)?;
+                }
+                Ok(result_table)
+            },
+        );
     }
 }
 
 pub struct LuaExecutor {
     lua: Lua,
+}
+
+impl Default for LuaExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LuaExecutor {
@@ -52,7 +107,7 @@ impl LuaExecutor {
         let globals = lua.globals();
 
         globals.set("null", lua.null()).unwrap();
-        globals.set("loom", LuaLoomInterface::new()).unwrap();
+        globals.set("loom", LuaLoomInterface::default()).unwrap();
         globals.set("__raw_embed", LUA_EMBEDS).unwrap();
 
         if let Err(e) = lua.load(LUA_EMBEDS).set_name("=<BUNDLE>").exec() {
