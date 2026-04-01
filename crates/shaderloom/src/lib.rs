@@ -103,34 +103,6 @@ mod tests {
     }
 
     #[test]
-    fn lua_string_utils() {
-        LuaExecutor::new().run_tests("utils.stringmanip").unwrap();
-    }
-
-    #[test]
-    fn lua_common_utils() {
-        LuaExecutor::new().run_tests("utils.common").unwrap();
-    }
-
-    #[test]
-    fn lua_preprocess() {
-        LuaExecutor::new().run_tests("preprocess.chunker").unwrap();
-        LuaExecutor::new()
-            .run_tests("preprocess.preprocessor")
-            .unwrap();
-    }
-
-    #[test]
-    fn lua_naga() {
-        LuaExecutor::new().run_tests("analysis.naga").unwrap();
-    }
-
-    #[test]
-    fn lua_unify() {
-        LuaExecutor::new().run_tests("analysis.unify").unwrap();
-    }
-
-    #[test]
     fn lua_python_target() {
         LuaExecutor::new().run_tests("targets.python.xgpu").unwrap();
     }

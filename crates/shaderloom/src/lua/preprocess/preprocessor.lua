@@ -192,6 +192,14 @@ local function test_proc(files)
     return pp:get_output()
 end
 
+function tests.chunker_braces()
+    local dedent = require("utils.stringmanip").dedent
+    local eq = require("utils.deepeq").string_equal
+    local source = "return a[b]]\n"
+    local translated = chunker.translate_source(source)
+    assert(eq(translated, "emit_raw[=[return a[b]]\n]=]"))
+end
+
 function tests.identity_translation()
     local dedent = require("utils.stringmanip").dedent
     local eq = require("utils.deepeq").string_equal
