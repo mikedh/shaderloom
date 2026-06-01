@@ -46,7 +46,7 @@ local STRUCT_FILE_TEMPLATE = [[
 use bytemuck::{Pod, Zeroable};
 
 ${STRUCTS}
-]]
+${CONSTS}]]
 
 ---@class RustStructMember
 ---@field name string
@@ -148,7 +148,65 @@ function m.prepare_struct(options, ty)
     return rstruct
 end
 
-function m.write_struct_defs(options, structs, env)
+-- Render a single module-scope `const` (identified by handle) as a Rust literal.
+-- Only literal initializers are supported (naga const-folds derived consts to a
+-- literal, so e.g. `MAXOPS + 2u` arrives already folded); anything else is skipped.
+function m.const_literal(data, init_handle, ty)
+    -- naga handles are 0-based; Lua arrays are 1-based.
+    local expr = data.global_expressions and data.global_expressions[init_handle + 1]
+    local lit = expr and expr.Literal
+    if not lit then return nil end
+    local _, value = next(lit)
+    if ty.name == "f32" or ty.name == "f16" then
+        local s = tostring(value)
+        if not s:find("[.eE]") then s = s .. ".0" end -- force a float literal
+        return s
+    elseif ty.name == "bool" then
+        return tostring(value)
+    else
+        return ("%d"):format(value)
+    end
+end
+
+-- Collect the `# export()`-annotated module-scope consts across all shaders,
+-- deduped by name (conflicting definitions of the same name are an error).
+function m.gather_consts(shaders, parsed)
+    local log = require "log"
+    local by_name, order = {}, {}
+    for idx, shader in ipairs(shaders) do
+        local exports = shader.annotations and shader.annotations.exports
+        local pdef = parsed[idx]
+        if exports and next(exports) and pdef and pdef.raw.constants then
+            for _, c in ipairs(pdef.raw.constants) do
+                if exports[c.name] then
+                    local ty = assert(pdef.types[c.ty],
+                        ("exported const '%s' has unknown type"):format(c.name))
+                    local tyname = m.rust_typename(ty)
+                    -- A `const` is a value, not a memory-mapped struct field, so the
+                    -- Pod `bool -> u8` mapping doesn't apply; emit a real Rust bool
+                    -- to match the `true`/`false` literal from `const_literal`.
+                    if ty.kind == "scalar" and ty.name == "bool" then tyname = "bool" end
+                    local value = m.const_literal(pdef.raw, c.init, ty)
+                    if not value then
+                        log.warn(("skipping export const '%s' (non-literal initializer)")
+                            :format(c.name))
+                    elseif by_name[c.name] then
+                        assert(by_name[c.name].value == value and by_name[c.name].tyname == tyname,
+                            ("exported const '%s' has conflicting definitions"):format(c.name))
+                    else
+                        by_name[c.name] = {name = c.name, tyname = tyname, value = value}
+                        table.insert(order, c.name)
+                    end
+                end
+            end
+        end
+    end
+    local out = {}
+    for _, name in ipairs(order) do table.insert(out, by_name[name]) end
+    return out
+end
+
+function m.write_struct_defs(options, structs, consts, env)
     if type(options) == 'string' then
         options = {output = options}
     end
@@ -166,7 +224,23 @@ function m.write_struct_defs(options, structs, env)
     end
     table.sort(frags)
     local struct_str = table.concat(frags, "\n")
-    local body = (options.file_template or STRUCT_FILE_TEMPLATE):with{STRUCTS=struct_str}
+
+    -- `pub const` block for the `# export()`-annotated shader consts, sorted for
+    -- determinism. Rendered into the `${CONSTS}` slot of the default template
+    -- (after the structs); custom templates may include `${CONSTS}` to place it.
+    -- When there are no exported consts the slot is empty so no blank lines leak.
+    local const_frags = {}
+    for _, c in ipairs(consts or {}) do
+        table.insert(const_frags, ("pub const %s: %s = %s;"):format(c.name, c.tyname, c.value))
+    end
+    local const_str = ""
+    if #const_frags > 0 then
+        table.sort(const_frags)
+        const_str = "\n" .. table.concat(const_frags, "\n") .. "\n"
+    end
+
+    local body = (options.file_template or STRUCT_FILE_TEMPLATE)
+        :with{STRUCTS = struct_str, CONSTS = const_str}
 
     fileio.write(options.output:with(env), body)
 end
@@ -182,7 +256,8 @@ function m.build(options)
     end
     if config.struct_definitions then
         local structs = unify.unify_host_shared_structs(parsed)
-        m.write_struct_defs(config.struct_definitions, structs, options.env)
+        local consts = m.gather_consts(shaders, parsed)
+        m.write_struct_defs(config.struct_definitions, structs, consts, options.env)
     end
     if config.bundle then
         raw.emit_bundle(config.bundle, shaders, options.env)
@@ -194,5 +269,93 @@ end
 
 local tests = {}
 m._tests = tests
+
+-- Build a {name -> const} index from a gather_consts result for easy assertions.
+local function index_consts(consts)
+    local by = {}
+    for _, c in ipairs(consts) do by[c.name] = c end
+    return by
+end
+
+-- Exercises the `# export()` const path end-to-end at the analysis layer:
+-- gather_consts -> const_literal -> rust_typename, across literal kinds.
+function tests.export_consts()
+    local naga = require "analysis.naga"
+    local src = [[
+    const MAXOPS: i32 = 254;
+    const GROUPSIZE: u32 = 8u;
+    const COUNT: u32 = GROUPSIZE + 2u;
+    const SCALE: f32 = 1.5;
+    const WHOLE: f32 = 2.0;
+    const FLAG: bool = true;
+    const NOT_EXPORTED: u32 = 3u;
+
+    @compute @workgroup_size(GROUPSIZE)
+    fn cs_main() {}
+    ]]
+    local parsed, errs = naga.parse(src, true)
+    assert(not errs, errs)
+    local exports = {MAXOPS = true, COUNT = true, SCALE = true, WHOLE = true, FLAG = true}
+    local by = index_consts(m.gather_consts(
+        {{annotations = {exports = exports}}}, {parsed}))
+
+    assert(by.MAXOPS and by.MAXOPS.tyname == "i32" and by.MAXOPS.value == "254",
+        "integer const")
+    assert(by.COUNT and by.COUNT.tyname == "u32" and by.COUNT.value == "10",
+        "derived const folded to a literal")
+    assert(by.SCALE and by.SCALE.tyname == "f32" and by.SCALE.value == "1.5",
+        "f32 const")
+    assert(by.WHOLE and by.WHOLE.tyname == "f32" and by.WHOLE.value == "2.0",
+        "whole-number f32 forced to a float literal")
+    -- regression: a bool const must emit Rust `bool`/`true`, not the Pod `u8`.
+    assert(by.FLAG and by.FLAG.tyname == "bool" and by.FLAG.value == "true",
+        "bool const emits a Rust bool")
+    assert(by.NOT_EXPORTED == nil, "unmarked const is not gathered")
+end
+
+-- Identical same-named consts across shaders dedup to one; conflicting ones error.
+function tests.export_consts_dedup_and_conflict()
+    local naga = require "analysis.naga"
+    local function parse(src)
+        local parsed, errs = naga.parse(src, true)
+        assert(not errs, errs)
+        return parsed
+    end
+    local eight_a = parse("const N: u32 = 8u;")
+    local eight_b = parse("const N: u32 = 8u;")
+    local nine = parse("const N: u32 = 9u;")
+    local exp = {{annotations = {exports = {N = true}}}, {annotations = {exports = {N = true}}}}
+
+    local consts = m.gather_consts(exp, {eight_a, eight_b})
+    assert(#consts == 1 and consts[1].value == "8", "identical consts dedup to one")
+
+    assert(not pcall(m.gather_consts, exp, {eight_a, nine}),
+        "conflicting definitions of an exported const must error")
+end
+
+-- regression: the default struct-file template must actually render exported
+-- consts (the `${CONSTS}` slot), and leave nothing behind when there are none.
+function tests.default_template_renders_consts()
+    local with_const = STRUCT_FILE_TEMPLATE:with{
+        STRUCTS = "// structs", CONSTS = "\npub const A: u32 = 1u;\n"}
+    assert(with_const:find("pub const A: u32 = 1u;", 1, true),
+        "CONSTS slot is rendered into the default template")
+    local empty = STRUCT_FILE_TEMPLATE:with{STRUCTS = "// structs", CONSTS = ""}
+    assert(not empty:find("${CONSTS}", 1, true),
+        "no leftover ${CONSTS} placeholder when there are no consts")
+end
+
+-- A const whose initializer isn't a literal (e.g. a composite) is skipped, not fatal.
+function tests.export_const_non_literal_skipped()
+    local naga = require "analysis.naga"
+    local src = [[
+    const PAIR: vec2<u32> = vec2<u32>(1u, 2u);
+    @compute @workgroup_size(1) fn cs() {}
+    ]]
+    local parsed, errs = naga.parse(src, true)
+    assert(not errs, errs)
+    local consts = m.gather_consts({{annotations = {exports = {PAIR = true}}}}, {parsed})
+    assert(#consts == 0, "non-literal (composite) const is skipped")
+end
 
 return m

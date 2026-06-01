@@ -719,6 +719,9 @@ end
 function tests:parse_exotics()
     -- exotic things you might bind
     local src = [[
+    // naga 29 requires acceleration_structure / ray_query behind an enable
+    enable wgpu_ray_query;
+
     // 'bindless' texture array
     @group(0) @binding(0)
     var textures: binding_array<texture_2d<f32>, 10>;

@@ -107,6 +107,22 @@ function Preprocessor:annotate_name(name)
     self:_pre_annotate("name", nil, name)
 end
 
+-- captures the name from a following `const NAME: T = ...;` declaration
+local CONST_NAME_PATTERN = "const%s+([%w_]+)"
+local function _annotate_export(call_info, source)
+    local const_name = assert(
+        match_in_next_statement(source, call_info.pos, CONST_NAME_PATTERN),
+        "Unmatched export annotation: expected a following `const NAME`"
+    )
+    return "exports", const_name, true
+end
+
+-- `# export` before a module-scope `const` marks it for emission into the
+-- generated host (Rust) struct file, alongside the uniform structs.
+function Preprocessor:annotate_export()
+    self:annotate(_annotate_export, {})
+end
+
 function Preprocessor:include(name)
     self:process_source(self.resolver(name), name)
 end
@@ -129,6 +145,7 @@ function Preprocessor:clear()
         visibility = self:_bind("annotate_visibility"),
         bindgroup = self:_bind("annotate_bindgroup"),
         name = self:_bind("annotate_name"),
+        export = self:_bind("annotate_export"),
     }
     setmetatable(self.env, {
         __index = _G
@@ -169,7 +186,7 @@ end
 ---@return PreprocessorOutput
 function Preprocessor:get_output()
     local output = table.concat(self.frags, "")
-    local annotations = {visibility={}, bindgroups={}}
+    local annotations = {visibility={}, bindgroups={}, exports={}}
     for _, annotator in ipairs(self.annotations) do
         local category, name, annotation = annotator:eval(output)
         if category and name then
@@ -358,6 +375,23 @@ function tests.name_annotation()
     }
     local annotations = test_proc(files).annotations
     assert(seq(annotations.name, "some_shader"))
+end
+
+function tests.export_annotation()
+    local dedent = require("utils.stringmanip").dedent
+    local files = {
+        MAIN=dedent[[
+        # export()
+        const MAXOPS: i32 = 254;
+        const NOT_EXPORTED: u32 = 3u;
+        # export()
+        const GROUP: u32 = 8u;
+        ]],
+    }
+    local exports = test_proc(files).annotations.exports
+    assert(exports.MAXOPS == true, "MAXOPS exported")
+    assert(exports.GROUP == true, "GROUP exported")
+    assert(exports.NOT_EXPORTED == nil, "unmarked const not exported")
 end
 
 return {

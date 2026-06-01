@@ -1,5 +1,8 @@
 # name "triangle"
 
+# export()
+const MAX_VERTS: u32 = 3u;
+
 struct Uniforms {
     @align(16) color_mult: vec3f,
     @align(16) something_else: f32,

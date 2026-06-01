@@ -1,5 +1,6 @@
 pub mod globutils;
 pub mod luaexec;
+pub mod minify;
 pub mod naga_parse;
 
 use anyhow::Result;
@@ -64,6 +65,7 @@ impl Default for Shaderloom {
 
 // Re-export related types for advanced users
 pub use globutils::{GlobItem, glob_items};
+pub use minify::minify_wgsl;
 pub use naga_parse::{LuaWGSLModule, parse_and_validate_wgsl, parse_wgsl};
 
 #[cfg(test)]
@@ -98,6 +100,10 @@ mod tests {
         shaderloom
             .executor()
             .run_tests("targets.python.xgpu")
+            .unwrap();
+        shaderloom
+            .executor()
+            .run_tests("targets.rust.wgpu")
             .unwrap();
         shaderloom.executor().run_tests("tests.dev").unwrap();
     }
