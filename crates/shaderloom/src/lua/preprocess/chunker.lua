@@ -1,13 +1,38 @@
--- does a thing
+-- Splits shader source with embedded preprocessor parts
+-- into chunks that are either verbatim source or Lua preprocessor code.
 
 local chunker = {}
+
+--- Embeds inner string into a Lua raw/multiline literal.
+--- 
+--- E.g., if inner is `foo`, produces `[[foo]]`. 
+--- Handles the case where inner includes multiline brackets:
+--- E.g., `foo[[bar]]` is embedded as `[=[foo[[bar]]]=]`
+--- 
+--- @param inner string
+--- @return string
+local function embed_lua_multiline(inner)
+    -- count the maximum number of sequential `]`s seen
+    -- in the inner string
+    local max_closing = 0
+    for run in inner:gmatch("%]+") do
+        max_closing = math.max(max_closing, #run)
+    end
+    local open, close = "[[", "]]"
+    if max_closing >= 2 then
+        local req_nest = math.max(0, max_closing - 1)
+        open = "[" .. string.rep("=", req_nest) .. "["
+        close = "]" .. string.rep("=", req_nest) .. "]"
+    end
+    return open .. inner .. close
+end
 
 local function emit_raw(frags, src)
     if src:sub(1,1) == "\n" then
         -- quirk with first newline of multiline strings being ignored
         src = "\n" .. src
     end
-    table.insert(frags, ("emit_raw[[%s]]"):format(src))
+    table.insert(frags, ("emit_raw%s"):format(embed_lua_multiline(src)))
 end
 
 local function emit(frags, src)
