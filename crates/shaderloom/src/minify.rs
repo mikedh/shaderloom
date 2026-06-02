@@ -99,6 +99,57 @@ fn preserves_interface(candidate: &str, want: &Interface) -> bool {
     }
 }
 
+/// Strip WGSL comments (line `//` and *nesting* block `/* */`) and blank lines,
+/// touching nothing else. The token stream is unchanged, so the result parses
+/// to an identical module — it can NEVER change a struct layout or binding ABI.
+/// This is the layout-safe fallback for shaders the naga round-trip would
+/// corrupt (its WGSL backend dropping `@align`/`@size`). WGSL has no string
+/// literals, so a plain scanner is sufficient; block comments nest per spec.
+fn strip_comments(src: &str) -> String {
+    let mut uncommented = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut block_depth: u32 = 0;
+    while let Some(c) = chars.next() {
+        if block_depth > 0 {
+            match c {
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    block_depth += 1;
+                }
+                '*' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    block_depth -= 1;
+                }
+                '\n' => uncommented.push('\n'), // keep line breaks inside comments
+                _ => {}
+            }
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            // Line comment: consume through the newline (which we re-emit).
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    uncommented.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            block_depth = 1;
+        } else {
+            uncommented.push(c);
+        }
+    }
+    // Drop blank lines and trailing whitespace.
+    let mut out = String::with_capacity(uncommented.len());
+    for line in uncommented.lines() {
+        let trimmed = line.trim_end();
+        if !trimmed.trim_start().is_empty() {
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Minify a WGSL source string by round-tripping it through naga.
 ///
 /// Always strips comments and normalizes whitespace (naga discards comments at
@@ -124,7 +175,14 @@ pub fn minify_wgsl(src: &str, rename: bool) -> Result<String> {
     // a binding the host still binds (an ABI change), and its size win is
     // marginal next to comment/whitespace stripping. Correctness first.
 
-    // Candidate outputs, most-minified first.
+    // Candidate outputs. The naga round-trip (with/without rename) is the most
+    // aggressive but can corrupt layout; `strip_comments` is a token-preserving
+    // textual pass that is *always* layout-safe — so a shader whose `@align`
+    // structs the round-trip would break still gets its comments/whitespace
+    // stripped; raw `src` is the last resort. We keep every candidate that
+    // provably preserves the source interface and emit the SMALLEST one, so a
+    // layout hazard costs only the rename/canonicalization win on that shader,
+    // not all minification of it.
     let mut candidates: Vec<String> = Vec::new();
     if rename {
         let mut renamed = module.clone();
@@ -135,26 +193,17 @@ pub fn minify_wgsl(src: &str, rename: bool) -> Result<String> {
             }
         }
     }
-    // Comment-free, whitespace-normalized, original names.
-    candidates.push(
-        wgsl_out::write_string(&module, &info, wgsl_out::WriterFlags::empty())
-            .map_err(|e| anyhow!("WGSL backend failed: {}", e))?,
-    );
-
-    for candidate in candidates {
-        if preserves_interface(&candidate, &want) {
-            return Ok(candidate);
-        }
+    if let Ok(s) = wgsl_out::write_string(&module, &info, wgsl_out::WriterFlags::empty()) {
+        candidates.push(s); // comment-free, whitespace-normalized, original names
     }
+    candidates.push(strip_comments(src)); // token-preserving → always layout-safe
+    candidates.push(src.to_string()); // guaranteed valid + interface-preserving
 
-    // Every minified form would change the struct layout / binding ABI (naga's
-    // WGSL backend dropping `@align`/`@size` is the usual cause). Emit the
-    // original source unchanged rather than a silently-miscompiled shader.
-    eprintln!(
-        "shaderloom: minify would alter struct layout or binding ABI; \
-         emitting unminified source to stay correct"
-    );
-    Ok(src.to_string())
+    candidates
+        .into_iter()
+        .filter(|c| preserves_interface(c, &want))
+        .min_by_key(|c| c.len())
+        .ok_or_else(|| anyhow!("no interface-preserving minification (unreachable)"))
 }
 
 /// Shorten identifiers in the mutable arenas to compact unique names.
@@ -409,5 +458,55 @@ struct S { a: f32, b: f32 }
         let out = minify_wgsl(SHADER, true).unwrap();
         let after = interface(&wgsl::parse_str(&out).unwrap());
         assert_eq!(before, after, "interface drifted:\n{out}");
+    }
+
+    /// A shader the naga round-trip would corrupt (`@align` struct) must STILL be
+    /// minified — just layout-safely. The output must drop comments and shrink,
+    /// keep the exact byte layout, and not be the raw source.
+    #[test]
+    fn align_shader_is_still_comment_stripped() {
+        const ALIGNED_WITH_COMMENTS: &str = r#"
+// AUTOGENERATED header that is pure bloat and must not ship.
+struct DepthViewUniforms {
+    @align(16) proj_mat: mat4x4<f32>,   // projection
+    @align(16) tool_rad: f32,           // tool radius (m)
+    @align(16) tool_rad_px: f32,        /* in pixels */
+    @align(16) axial_finish: f32,       // finish stock
+}
+@group(0) @binding(0) var<storage, read> u: DepthViewUniforms;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+// the entry point
+@compute @workgroup_size(1)
+fn cs_main() {
+    // touch every field
+    o[0] = u.tool_rad + u.tool_rad_px + u.axial_finish + u.proj_mat[0][0];
+}
+"#;
+        let want = layouts(ALIGNED_WITH_COMMENTS);
+        for rename in [false, true] {
+            let out = minify_wgsl(ALIGNED_WITH_COMMENTS, rename).unwrap();
+            // Layout byte-for-byte identical (the whole point).
+            assert_eq!(layouts(&out), want, "layout changed (rename={rename}):\n{out}");
+            // Still minified: comments gone, smaller, and NOT the raw source.
+            assert!(!out.contains("//") && !out.contains("/*"), "comments survived:\n{out}");
+            assert!(
+                out.len() < ALIGNED_WITH_COMMENTS.len(),
+                "not actually minified (rename={rename})"
+            );
+            assert_ne!(out, ALIGNED_WITH_COMMENTS, "fell back to raw source");
+            // And the @align attributes are still present (proves layout-safe path).
+            assert!(out.contains("@align(16)"), "align dropped:\n{out}");
+        }
+    }
+
+    /// Nested and line comments (incl. `/* */`) are removed without disturbing
+    /// tokens, and the result still parses.
+    #[test]
+    fn strip_comments_handles_nested_blocks() {
+        let src = "const A: u32 = 1u; /* a /* nested */ block */ const B: u32 = 2u; // line\nconst C: u32 = 3u;";
+        let out = strip_comments(src);
+        assert!(!out.contains("/*") && !out.contains("//"), "comments remain: {out}");
+        assert!(out.contains("const A") && out.contains("const B") && out.contains("const C"));
+        assert!(wgsl::parse_str(&out).is_ok(), "stripped output invalid: {out}");
     }
 }
