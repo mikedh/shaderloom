@@ -283,6 +283,7 @@ function tests.export_consts()
     local naga = require "analysis.naga"
     local src = [[
     const MAXOPS: i32 = 254;
+    const NEG: i32 = -5;
     const GROUPSIZE: u32 = 8u;
     const COUNT: u32 = GROUPSIZE + 2u;
     const SCALE: f32 = 1.5;
@@ -295,12 +296,14 @@ function tests.export_consts()
     ]]
     local parsed, errs = naga.parse(src, true)
     assert(not errs, errs)
-    local exports = {MAXOPS = true, COUNT = true, SCALE = true, WHOLE = true, FLAG = true}
+    local exports = {MAXOPS = true, NEG = true, COUNT = true, SCALE = true, WHOLE = true, FLAG = true}
     local by = index_consts(m.gather_consts(
         {{annotations = {exports = exports}}}, {parsed}))
 
     assert(by.MAXOPS and by.MAXOPS.tyname == "i32" and by.MAXOPS.value == "254",
         "integer const")
+    assert(by.NEG and by.NEG.tyname == "i32" and by.NEG.value == "-5",
+        "negative integer const")
     assert(by.COUNT and by.COUNT.tyname == "u32" and by.COUNT.value == "10",
         "derived const folded to a literal")
     assert(by.SCALE and by.SCALE.tyname == "f32" and by.SCALE.value == "1.5",

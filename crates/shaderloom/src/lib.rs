@@ -105,6 +105,7 @@ mod tests {
             .executor()
             .run_tests("targets.rust.wgpu")
             .unwrap();
+        shaderloom.executor().run_tests("targets.raw").unwrap();
         shaderloom.executor().run_tests("tests.dev").unwrap();
     }
 

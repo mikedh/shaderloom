@@ -122,4 +122,49 @@ function raw_target.build(options)
     end
 end
 
+local tests = {}
+raw_target._tests = tests
+
+-- A comment-bearing compute shader with a distinctively named module const, so
+-- minification is observable (comment gone, single line, const renamed away).
+local MINIFY_SRC = [[
+// a header comment that minify must strip
+const RECOGNIZABLE_CONST: u32 = 3u;
+@group(0) @binding(0) var<storage, read_write> o: array<u32>;
+@compute @workgroup_size(1)
+fn cs_main() { o[0] = RECOGNIZABLE_CONST; }
+]]
+
+-- The `minify = {rename = true}` branch of emit_loose_shaders, end to end:
+-- capture fileio.write and assert the written text was actually minified.
+function tests.minify_loose_shaders_branch()
+    local fileio = require "utils.fileio"
+    local captured = {}
+    local real_write = fileio.write
+    fileio.write = function(path, body) captured[path] = body end
+    local ok, err = pcall(raw_target.emit_loose_shaders,
+        {output = "loose_min.wgsl", minify = {rename = true}},
+        {{name = "shader", source = MINIFY_SRC}},
+        {})
+    fileio.write = real_write
+    assert(ok, err)
+
+    local body = captured["loose_min.wgsl"]
+    assert(body, "minified loose shader was not written")
+    assert(not body:find("//", 1, true), "comments survived minify: " .. body)
+    assert(not body:find("\n", 1, true), "newlines survived minify: " .. body)
+    assert(not body:find("RECOGNIZABLE_CONST", 1, true),
+        "rename did not propagate through the minify option: " .. body)
+end
+
+-- The `loom:minify_wgsl` binding directly (Rust<->Lua marshalling + error map).
+function tests.minify_binding_direct()
+    local out = loom:minify_wgsl("// c\n@compute @workgroup_size(1)\nfn cs_main() {}", false)
+    assert(type(out) == "string" and #out > 0, "no output from minify_wgsl")
+    assert(not out:find("//", 1, true), "comments survived: " .. out)
+    -- invalid WGSL surfaces as a Lua error rather than a bad string.
+    assert(not pcall(function() return loom:minify_wgsl("not wgsl {{{", false) end),
+        "invalid WGSL should raise")
+end
+
 return raw_target
