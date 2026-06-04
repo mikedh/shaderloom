@@ -25,13 +25,10 @@ impl UserData for LuaLoomInterface {
             Ok(parse_wgsl(&src)?)
         });
 
-        methods.add_method(
-            "minify_wgsl",
-            |_, _this: &Self, (src, rename): (String, Option<bool>)| {
-                crate::minify::minify_wgsl(&src, rename.unwrap_or(false))
-                    .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
-            },
-        );
+        methods.add_method("minify_wgsl", |_, _this: &Self, src: String| {
+            crate::minify::minify_wgsl(&src)
+                .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+        });
 
         methods.add_method(
             "parse_and_validate_wgsl",

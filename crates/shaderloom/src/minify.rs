@@ -1,7 +1,7 @@
 //! WGSL minification via a naga round-trip, made **layout-faithful**.
 //!
-//! `minify_wgsl` tree-shakes (`compact`), optionally renames identifiers, and
-//! re-emits through naga's WGSL backend. That backend drops struct `@align`/
+//! `minify_wgsl` tree-shakes (`compact`), renames identifiers to opaque names,
+//! and re-emits through naga's WGSL backend. That backend drops struct `@align`/
 //! `@size` and repacks `var<uniform>`/`storage` structs to natural layout — but
 //! the generated host still expects the source layout, so the bytes would
 //! silently desync. We therefore **re-inject** the exact byte layout afterwards
@@ -267,15 +267,14 @@ fn collapse_whitespace(text: &str) -> String {
 /// Minify a WGSL source string for shipping in a binary.
 ///
 /// The goal is **obfuscation**, not byte count: tree-shake dead code via
-/// `compact`, optionally rename identifiers to opaque names, re-emit through
-/// naga's WGSL backend, then re-inject the source byte layout (see
-/// [`reinject_layout`]).
+/// `compact`, rename identifiers to opaque names, re-emit through naga's WGSL
+/// backend, then re-inject the source byte layout (see [`reinject_layout`]).
 ///
 /// Candidates are tried obfuscation-first and the first ABI-preserving one wins:
 /// tree-shake + rename, then rename only (in case `compact` would drop a
 /// host-bound binding), then the raw source. The raw source preserves its own
 /// ABI, so this never fails or ships wrong bytes.
-pub fn minify_wgsl(src: &str, rename: bool) -> Result<String> {
+pub fn minify_wgsl(src: &str) -> Result<String> {
     let module = wgsl::parse_str(src).map_err(|e| anyhow!("{}", e.emit_to_string(src)))?;
     validate(&module)?;
 
@@ -283,19 +282,19 @@ pub fn minify_wgsl(src: &str, rename: bool) -> Result<String> {
     let want_bindings = bindings(&module);
     let want_entries = entry_points(&module);
 
-    // compact (tree-shake) + optional rename → naga write → re-inject layout → ws.
+    // compact (tree-shake) + rename → naga write → re-inject layout → ws.
     let build = |do_compact: bool| -> Option<String> {
         let mut m = module.clone();
         if do_compact {
             naga::compact::compact(&mut m, naga::compact::KeepUnused::No);
         }
-        let counter = if rename { rename_identifiers(&mut m) } else { 0 };
+        let counter = rename_identifiers(&mut m);
         let info = validate(&m).ok()?;
         let text = wgsl_out::write_string(&m, &info, wgsl_out::WriterFlags::empty()).ok()?;
         let text = reinject_layout(&m, text, &want_structs);
         // The IR rename can't reach naga's write-time baked temporaries (`_e12`),
         // so shorten them in the emitted text, continuing the same counter.
-        let text = if rename { rename_baked_temps(&text, counter) } else { text };
+        let text = rename_baked_temps(&text, counter);
         Some(collapse_whitespace(&shorten_type_aliases(&text)))
     };
 
@@ -494,12 +493,10 @@ fn cs_main() {
         assert_eq!((span, offsets.as_slice()), (EXPECT_SPAN, EXPECT_OFFSETS),
             "source @align layout is not what the host ABI expects");
 
-        for rename in [false, true] {
-            let out = minify_wgsl(ALIGN_SHADER, rename).unwrap();
-            let (span, offsets) = layouts(&out)["DepthViewUniforms"].clone();
-            assert_eq!((span, offsets.as_slice()), (EXPECT_SPAN, EXPECT_OFFSETS),
-                "minified @align layout drifted (rename={rename}):\n{out}");
-        }
+        let out = minify_wgsl(ALIGN_SHADER).unwrap();
+        let (span, offsets) = layouts(&out)["DepthViewUniforms"].clone();
+        assert_eq!((span, offsets.as_slice()), (EXPECT_SPAN, EXPECT_OFFSETS),
+            "minified @align layout drifted:\n{out}");
     }
 
     /// The ABI guard is the entire safety argument for the re-inject hack
@@ -551,19 +548,16 @@ fn cs_main() { _ = u.tool_rad; }
     #[test]
     fn minify_ships_the_obfuscating_path_with_correct_layout() {
         let want = layouts(ALIGN_SHADER);
-        for rename in [false, true] {
-            let out = minify_wgsl(ALIGN_SHADER, rename).unwrap();
-            // Layout byte-identical (the carve correctness invariant).
-            assert_eq!(layouts(&out), want, "layout changed (rename={rename}):\n{out}");
-            // The naga path shipped (re-injected `@size`), not the raw fallback.
-            assert!(out.contains("@size("), "did not take the obfuscating path:\n{out}");
-            assert!(!out.contains("//") && !out.contains("/*"), "comments survived:\n{out}");
-            // Formatting whitespace collapsed.
-            assert!(!out.contains('\n'), "newlines survived:\n{out}");
-        }
-        // With rename, descriptive global identifiers are obfuscated away.
-        let renamed = minify_wgsl(ALIGN_SHADER, true).unwrap();
-        assert!(!renamed.contains("var<uniform> u"), "globals not renamed:\n{renamed}");
+        let out = minify_wgsl(ALIGN_SHADER).unwrap();
+        // Layout byte-identical (the carve correctness invariant).
+        assert_eq!(layouts(&out), want, "layout changed:\n{out}");
+        // The naga path shipped (re-injected `@size`), not the raw fallback.
+        assert!(out.contains("@size("), "did not take the obfuscating path:\n{out}");
+        assert!(!out.contains("//") && !out.contains("/*"), "comments survived:\n{out}");
+        // Formatting whitespace collapsed.
+        assert!(!out.contains('\n'), "newlines survived:\n{out}");
+        // Descriptive global identifiers are obfuscated away.
+        assert!(!out.contains("var<uniform> u"), "globals not renamed:\n{out}");
     }
 
     /// A naturally-packed struct (no `@align`/`@size` overrides) is laid out
@@ -579,11 +573,9 @@ struct P { width: i32, height: i32, count: u32, scale: f32 }
 fn m() { o[0] = (f32(p.width + p.height) * p.scale) + f32(p.count); }
 "#;
         let want = layouts(src);
-        for rename in [false, true] {
-            let out = minify_wgsl(src, rename).unwrap();
-            assert_eq!(layouts(&out), want, "layout changed (rename={rename}):\n{out}");
-            assert!(!out.contains("@size("), "stamped @size on a natural struct:\n{out}");
-        }
+        let out = minify_wgsl(src).unwrap();
+        assert_eq!(layouts(&out), want, "layout changed:\n{out}");
+        assert!(!out.contains("@size("), "stamped @size on a natural struct:\n{out}");
     }
 
     /// Byte-layout corpus across every layout-affecting construct. Fails hard if
@@ -615,10 +607,8 @@ fn m() { o[0] = (f32(p.width + p.height) * p.scale) + f32(p.count); }
         ];
         for (i, src) in HAZARDS.iter().enumerate() {
             let want = layouts(src);
-            for rename in [false, true] {
-                let out = minify_wgsl(src, rename).unwrap();
-                assert_eq!(layouts(&out), want, "hazard {i} drifted (rename={rename}):\n{out}");
-            }
+            let out = minify_wgsl(src).unwrap();
+            assert_eq!(layouts(&out), want, "hazard {i} drifted:\n{out}");
         }
     }
 
@@ -656,24 +646,22 @@ fn fs_main(frag: VsOut) -> @location(0) vec4<f32> {
 "#;
         let want = layouts(src);
         let want_entries = entry_points(&wgsl::parse_str(src).unwrap());
-        for rename in [false, true] {
-            let out = minify_wgsl(src, rename).unwrap();
-            // Uniform data struct layout preserved byte-for-byte.
-            assert_eq!(layouts(&out), want, "layout changed (rename={rename}):\n{out}");
-            // Both pipeline stages survive with their stage kinds intact.
-            assert_eq!(
-                entry_points(&wgsl::parse_str(&out).unwrap()),
-                want_entries,
-                "entry points/stages changed (rename={rename}):\n{out}"
-            );
-            // Exactly the two `Uniforms` members get `@size`; the I/O struct
-            // (`VsOut`) is skipped, so the count is 2, not 4.
-            assert_eq!(
-                out.matches("@size(").count(),
-                2,
-                "I/O struct must not be re-injected (rename={rename}):\n{out}"
-            );
-        }
+        let out = minify_wgsl(src).unwrap();
+        // Uniform data struct layout preserved byte-for-byte.
+        assert_eq!(layouts(&out), want, "layout changed:\n{out}");
+        // Both pipeline stages survive with their stage kinds intact.
+        assert_eq!(
+            entry_points(&wgsl::parse_str(&out).unwrap()),
+            want_entries,
+            "entry points/stages changed:\n{out}"
+        );
+        // Exactly the two `Uniforms` members get `@size`; the I/O struct
+        // (`VsOut`) is skipped, so the count is 2, not 4.
+        assert_eq!(
+            out.matches("@size(").count(),
+            2,
+            "I/O struct must not be re-injected:\n{out}"
+        );
     }
 
     /// Any `_e<digit>` token (naga's baked-temporary naming scheme) present.
@@ -715,7 +703,7 @@ fn fs_main(frag: VsOut) -> @location(0) vec4<f32> {
         let naive = wgsl_out::write_string(&module, &info, wgsl_out::WriterFlags::empty()).unwrap();
         assert!(has_baked_temp(&naive), "test shader has no baked temps to exercise");
 
-        let out = minify_wgsl(ALIGN_SHADER, true).unwrap();
+        let out = minify_wgsl(ALIGN_SHADER).unwrap();
         assert!(!has_baked_temp(&out), "baked temporaries survived rename:\n{out}");
         assert!(wgsl::parse_str(&out).is_ok(), "renamed output is not valid WGSL:\n{out}");
     }
@@ -789,7 +777,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
             let info = validate(&m).unwrap();
             let reference = wgsl_out::write_string(&m, &info, wgsl_out::WriterFlags::empty()).unwrap();
 
-            let minified = minify_wgsl(src, true).unwrap();
+            let minified = minify_wgsl(src).unwrap();
             assert_eq!(
                 canonical(&reference),
                 canonical(&minified),
@@ -814,7 +802,7 @@ fn dead_helper_with_a_recognizable_body(x: f32) -> f32 {
 @compute @workgroup_size(1)
 fn m() { o[0] = used(1.0); }
 "#;
-        let out = minify_wgsl(src, true).unwrap();
+        let out = minify_wgsl(src).unwrap();
         assert!(!out.contains("123456.0"), "dead code survived:\n{out}");
         assert!(wgsl::parse_str(&out).is_ok());
     }
@@ -829,7 +817,7 @@ fn m() { o[0] = used(1.0); }
 @compute @workgroup_size(1)
 fn m() { o[0] = 1.0; }
 "#;
-        let out = minify_wgsl(src, true).unwrap();
+        let out = minify_wgsl(src).unwrap();
         let got = bindings(&wgsl::parse_str(&out).unwrap());
         assert_eq!(got, bindings(&wgsl::parse_str(src).unwrap()), "a binding was dropped:\n{out}");
         // The binding-preserving fallback still obfuscates: the descriptive name
@@ -853,7 +841,7 @@ fn dead_b(x: f32) -> f32 { return x + 222.0; }
 fn cs_main() { o[0] = used(u.a) + u.b; }
 "#;
         let want = layouts(src);
-        let out = minify_wgsl(src, true).unwrap();
+        let out = minify_wgsl(src).unwrap();
         assert_eq!(layouts(&out), want, "layout changed:\n{out}");
         // The whole dead chain (a→b) is gone; the used helper + entry stay.
         assert!(!out.contains("111.0") && !out.contains("222.0"), "dead code survived:\n{out}");
@@ -872,7 +860,7 @@ fn cs_main() { o[0] = used(u.a) + u.b; }
 
         // End to end: ALIGN_SHADER's mat4x4<f32> members come out aliased, still
         // valid and layout-preserving.
-        let out = minify_wgsl(ALIGN_SHADER, true).unwrap();
+        let out = minify_wgsl(ALIGN_SHADER).unwrap();
         assert!(out.contains("mat4x4f") && !out.contains("mat4x4<f32>"),
             "matrix type not aliased:\n{out}");
         assert!(wgsl::parse_str(&out).is_ok());
@@ -911,8 +899,8 @@ fn cs_main() { o[0] = used(u.a) + u.b; }
     /// through as a "minified" string.
     #[test]
     fn invalid_wgsl_is_an_error() {
-        assert!(minify_wgsl("this is not wgsl {{{", true).is_err());
-        assert!(minify_wgsl("fn m( { ", false).is_err());
+        assert!(minify_wgsl("this is not wgsl {{{").is_err());
+        assert!(minify_wgsl("fn m( { ").is_err());
     }
 
     /// Minifying an already-minified shader is a fixed point: it stays valid and
@@ -921,11 +909,9 @@ fn cs_main() { o[0] = used(u.a) + u.b; }
     #[test]
     fn minify_is_idempotent() {
         let want = layouts(ALIGN_SHADER);
-        for rename in [false, true] {
-            let once = minify_wgsl(ALIGN_SHADER, rename).unwrap();
-            let twice = minify_wgsl(&once, rename).unwrap();
-            assert_eq!(layouts(&twice), want, "layout drifted on re-minify:\n{twice}");
-            assert!(wgsl::parse_str(&twice).is_ok(), "re-minify not valid WGSL:\n{twice}");
-        }
+        let once = minify_wgsl(ALIGN_SHADER).unwrap();
+        let twice = minify_wgsl(&once).unwrap();
+        assert_eq!(layouts(&twice), want, "layout drifted on re-minify:\n{twice}");
+        assert!(wgsl::parse_str(&twice).is_ok(), "re-minify not valid WGSL:\n{twice}");
     }
 }
